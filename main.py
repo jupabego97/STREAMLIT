@@ -4,10 +4,11 @@ combined_alegra_extract.py
 ==========================
 Ejecución orquestada de los tres extractores de Alegra en un único comando.
 
-Este script lanza, en el orden recomendado, los tres procesos que ya tienes:
-  1. extractor_facturas_alegra.py   → facturas/ventas
-  2. def_proveedor.py               → facturas de proveedor
-  3. items-extract.py               → inventario (ítems)
+Este script lanza, en el orden recomendado, los procesos de extracción y generación de reportes:
+  1. extractor_facturas_alegra_sagrado.py   → facturas/ventas
+  2. extractor_facturas_proveedor_optimizado.py  → facturas de proveedor
+  3. items-extract.py                       → inventario (ítems)
+  4. generar_reporte_ventas_30dias.py       → reporte de ventas (SIEMPRE AL FINAL)
 
 Requisitos
 ----------
@@ -40,6 +41,7 @@ EXTRACTORS = [
     "extractor_facturas_alegra_sagrado.py",  # Ventas (facturas) - versión optimizada con concurrencia
     "extractor_facturas_proveedor_optimizado.py",  # Facturas de proveedor - versión optimizada
     "items-extract.py",              # Ítems / inventario
+    "generar_reporte_ventas_30dias.py",  # Generador de reportes de ventas (SIEMPRE AL FINAL)
 ]
 
 
@@ -86,7 +88,7 @@ def main() -> None:
 
         run_script(script_path)
 
-    logger.info(">>> Proceso completo: facturas, facturas proveedor e ítems extraídos correctamente <<<")
+    logger.info(">>> Proceso completo: facturas, facturas proveedor, ítems extraídos y reporte de ventas generado correctamente <<<")
 
 
 if __name__ == "__main__":
