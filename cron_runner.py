@@ -3,43 +3,45 @@
 Cron Runner para ejecutar main.py periódicamente
 -------------------------------------------------
 
-Este script está diseñado para ejecutarse como un servicio de cron en Railway.
+Este script está diseñado para ejecutarse como un servicio de cron.
 Ejecuta main.py cada 3 días usando schedule.
+
+Uso:
+    python cron_runner.py
 """
 from __future__ import annotations
 
-import logging
-import os
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Intentar importar schedule, si no está disponible, usar time.sleep
+from config import settings
+from utils import setup_logging
+
+# Intentar importar schedule
 try:
     import schedule
     SCHEDULE_AVAILABLE = True
 except ImportError:
     SCHEDULE_AVAILABLE = False
-    logging.warning("schedule no está disponible. Instala con: pip install schedule")
 
 # Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logger = setup_logging("cron_runner")
 
-logger = logging.getLogger(__name__)
-
-# Intervalo en días
-INTERVAL_DAYS = 3
+# Configuración
+INTERVAL_DAYS = settings.CRON_INTERVAL_DAYS
 SCRIPT_NAME = "main.py"
 
 
-def run_main_script():
-    """Ejecuta el script main.py."""
+def run_main_script() -> bool:
+    """
+    Ejecuta el script main.py.
+    
+    Returns:
+        bool: True si la ejecución fue exitosa.
+    """
     script_dir = Path(__file__).resolve().parent
     script_path = script_dir / SCRIPT_NAME
     
@@ -51,7 +53,6 @@ def run_main_script():
     start_time = datetime.now()
     
     try:
-        # Ejecutar el script
         result = subprocess.run(
             [sys.executable, str(script_path)],
             cwd=str(script_dir),
@@ -65,7 +66,7 @@ def run_main_script():
         return True
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Error ejecutando {SCRIPT_NAME}: {e}")
+        logger.error(f"❌ Error ejecutando {SCRIPT_NAME}: código de salida {e.returncode}")
         return False
     except Exception as e:
         logger.error(f"❌ Error inesperado: {e}")
@@ -74,9 +75,9 @@ def run_main_script():
 
 def main():
     """Función principal del cron runner."""
-    logger.info("=" * 60)
-    logger.info("🔄 Iniciando Cron Runner para ejecutar main.py cada 3 días")
-    logger.info("=" * 60)
+    logger.info("="*60)
+    logger.info(f"🔄 Iniciando Cron Runner - Intervalo: {INTERVAL_DAYS} días")
+    logger.info("="*60)
     
     # Ejecutar inmediatamente al inicio
     logger.info("📅 Ejecutando primera ejecución...")
@@ -84,7 +85,7 @@ def main():
     
     # Calcular próximo intervalo
     next_run = datetime.now() + timedelta(days=INTERVAL_DAYS)
-    logger.info(f"⏰ Próxima ejecución programada para: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"⏰ Próxima ejecución: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
     
     if SCHEDULE_AVAILABLE:
         # Usar schedule para programar ejecuciones
@@ -96,10 +97,10 @@ def main():
             time.sleep(3600)  # Verificar cada hora
     else:
         # Fallback: usar time.sleep
-        logger.info("⏰ Usando modo simple: esperando 3 días para próxima ejecución...")
+        logger.warning("⚠️ Módulo 'schedule' no disponible. Usando modo simple.")
         while True:
-            time.sleep(INTERVAL_DAYS * 24 * 60 * 60)  # Esperar 3 días
-            logger.info(f"⏰ Ejecutando tarea programada...")
+            time.sleep(INTERVAL_DAYS * 24 * 60 * 60)
+            logger.info("⏰ Ejecutando tarea programada...")
             run_main_script()
             next_run = datetime.now() + timedelta(days=INTERVAL_DAYS)
             logger.info(f"⏰ Próxima ejecución: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -114,4 +115,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Error fatal: {e}")
         sys.exit(1)
-
