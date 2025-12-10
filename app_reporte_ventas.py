@@ -1199,6 +1199,445 @@ def render_export(df: pd.DataFrame):
 
 
 # =============================================================================
+# Sugerencias de Compras a Proveedores
+# =============================================================================
+
+@st.cache_data(ttl=300)
+def load_inventory_data() -> pd.DataFrame:
+    """Carga datos de inventario desde la tabla items."""
+    try:
+        engine = get_database_engine()
+        query = "SELECT id, nombre, cantidad_disponible, familia, precio FROM items"
+        df = pd.read_sql(query, engine)
+        
+        if not df.empty:
+            df['cantidad_disponible'] = pd.to_numeric(df['cantidad_disponible'], errors='coerce').fillna(0)
+            df['precio'] = pd.to_numeric(df['precio'], errors='coerce').fillna(0)
+        
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def calculate_reorder_suggestions(df_ventas: pd.DataFrame, df_inventario: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula sugerencias de reposición basándose en ventas y stock actual.
+    
+    Criterios:
+    - Productos con ventas en los últimos 30 días
+    - Stock actual bajo (menos de 15 días de venta)
+    - Cantidad sugerida = ventas de 30 días (para cubrir próximo mes)
+    """
+    if df_ventas.empty:
+        return pd.DataFrame()
+    
+    # Calcular ventas por producto
+    ventas_producto = df_ventas.groupby('nombre').agg({
+        'cantidad': 'sum',
+        'total_venta': 'sum',
+        'precio_promedio_compra': 'first',
+        'proveedor_moda': 'first',
+        'familia': 'first'
+    }).reset_index()
+    
+    ventas_producto.columns = ['nombre', 'unidades_vendidas_30d', 'total_ventas', 
+                                'precio_compra', 'proveedor', 'familia']
+    
+    # Calcular venta diaria promedio
+    ventas_producto['venta_diaria'] = ventas_producto['unidades_vendidas_30d'] / 30
+    
+    # Unir con inventario si está disponible
+    if not df_inventario.empty:
+        ventas_producto = ventas_producto.merge(
+            df_inventario[['nombre', 'cantidad_disponible']],
+            on='nombre',
+            how='left'
+        )
+        ventas_producto['cantidad_disponible'] = ventas_producto['cantidad_disponible'].fillna(0)
+    else:
+        ventas_producto['cantidad_disponible'] = 0
+    
+    # Calcular días de stock
+    ventas_producto['dias_stock'] = np.where(
+        ventas_producto['venta_diaria'] > 0,
+        ventas_producto['cantidad_disponible'] / ventas_producto['venta_diaria'],
+        999  # Si no hay ventas, stock infinito
+    )
+    
+    # Calcular cantidad sugerida (para cubrir 30 días + margen de seguridad 20%)
+    ventas_producto['cantidad_sugerida'] = np.maximum(
+        0,
+        (ventas_producto['unidades_vendidas_30d'] * 1.2) - ventas_producto['cantidad_disponible']
+    ).round(0).astype(int)
+    
+    # Calcular costo estimado
+    ventas_producto['costo_estimado'] = ventas_producto['cantidad_sugerida'] * ventas_producto['precio_compra']
+    
+    # Determinar prioridad
+    def calcular_prioridad(row):
+        if row['dias_stock'] <= 3:
+            return '🔴 Urgente'
+        elif row['dias_stock'] <= 7:
+            return '🟠 Alta'
+        elif row['dias_stock'] <= 15:
+            return '🟡 Media'
+        else:
+            return '🟢 Baja'
+    
+    ventas_producto['prioridad'] = ventas_producto.apply(calcular_prioridad, axis=1)
+    
+    # Filtrar solo productos que necesitan reposición
+    productos_a_pedir = ventas_producto[ventas_producto['cantidad_sugerida'] > 0].copy()
+    
+    return productos_a_pedir.sort_values(['prioridad', 'dias_stock'], ascending=[True, True])
+
+
+def render_low_stock_alerts(df_sugerencias: pd.DataFrame):
+    """Renderiza alertas de productos con bajo stock."""
+    if df_sugerencias.empty:
+        st.info("✅ No hay productos con stock crítico.")
+        return
+    
+    st.subheader("🚨 Productos con Stock Crítico")
+    
+    # Filtrar por prioridad
+    urgentes = df_sugerencias[df_sugerencias['prioridad'] == '🔴 Urgente']
+    altos = df_sugerencias[df_sugerencias['prioridad'] == '🟠 Alta']
+    medios = df_sugerencias[df_sugerencias['prioridad'] == '🟡 Media']
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            "🔴 Urgente (≤3 días)",
+            f"{len(urgentes)} productos",
+            delta=f"${urgentes['costo_estimado'].sum():,.0f}" if not urgentes.empty else "$0"
+        )
+    
+    with col2:
+        st.metric(
+            "🟠 Alta (≤7 días)",
+            f"{len(altos)} productos",
+            delta=f"${altos['costo_estimado'].sum():,.0f}" if not altos.empty else "$0"
+        )
+    
+    with col3:
+        st.metric(
+            "🟡 Media (≤15 días)",
+            f"{len(medios)} productos",
+            delta=f"${medios['costo_estimado'].sum():,.0f}" if not medios.empty else "$0"
+        )
+    
+    # Mostrar productos urgentes expandidos
+    if not urgentes.empty:
+        with st.expander("🔴 Ver Productos URGENTES", expanded=True):
+            st.dataframe(
+                urgentes[['nombre', 'proveedor', 'cantidad_disponible', 'venta_diaria', 
+                         'dias_stock', 'cantidad_sugerida', 'costo_estimado']].style.format({
+                    'cantidad_disponible': '{:,.0f}',
+                    'venta_diaria': '{:,.1f}',
+                    'dias_stock': '{:,.1f} días',
+                    'cantidad_sugerida': '{:,.0f}',
+                    'costo_estimado': '${:,.2f}'
+                }),
+                use_container_width=True
+            )
+
+
+def render_purchase_by_provider(df_sugerencias: pd.DataFrame):
+    """Renderiza sugerencias de compra agrupadas por proveedor."""
+    if df_sugerencias.empty:
+        st.info("No hay sugerencias de compra disponibles.")
+        return
+    
+    st.subheader("🏭 Pedidos por Proveedor")
+    
+    # Filtrar productos con proveedor conocido
+    df_con_proveedor = df_sugerencias[df_sugerencias['proveedor'].notna()].copy()
+    
+    if df_con_proveedor.empty:
+        st.warning("⚠️ No hay datos de proveedores para los productos sugeridos.")
+        return
+    
+    # Selector de proveedor
+    proveedores = ['Todos'] + sorted(df_con_proveedor['proveedor'].unique().tolist())
+    proveedor_seleccionado = st.selectbox(
+        "Seleccionar Proveedor",
+        options=proveedores,
+        key="proveedor_pedido"
+    )
+    
+    # Filtrar por proveedor
+    if proveedor_seleccionado != 'Todos':
+        df_filtrado = df_con_proveedor[df_con_proveedor['proveedor'] == proveedor_seleccionado]
+    else:
+        df_filtrado = df_con_proveedor
+    
+    # Resumen por proveedor
+    resumen_proveedores = df_con_proveedor.groupby('proveedor').agg({
+        'nombre': 'count',
+        'cantidad_sugerida': 'sum',
+        'costo_estimado': 'sum'
+    }).reset_index()
+    resumen_proveedores.columns = ['Proveedor', 'Productos', 'Unidades', 'Costo Total']
+    resumen_proveedores = resumen_proveedores.sort_values('Costo Total', ascending=False)
+    
+    # Mostrar resumen
+    st.markdown("#### 📊 Resumen por Proveedor")
+    st.dataframe(
+        resumen_proveedores.style.format({
+            'Productos': '{:,.0f}',
+            'Unidades': '{:,.0f}',
+            'Costo Total': '${:,.2f}'
+        }),
+        use_container_width=True
+    )
+    
+    st.markdown("---")
+    
+    # Mostrar detalle
+    if proveedor_seleccionado == 'Todos':
+        # Mostrar expandibles por proveedor
+        for proveedor in resumen_proveedores['Proveedor'].tolist():
+            productos_prov = df_con_proveedor[df_con_proveedor['proveedor'] == proveedor]
+            costo_prov = productos_prov['costo_estimado'].sum()
+            unidades_prov = productos_prov['cantidad_sugerida'].sum()
+            
+            with st.expander(f"🏭 {proveedor} - {len(productos_prov)} productos - {unidades_prov:,.0f} unidades - ${costo_prov:,.2f}"):
+                st.dataframe(
+                    productos_prov[['nombre', 'prioridad', 'cantidad_disponible', 
+                                   'cantidad_sugerida', 'precio_compra', 'costo_estimado']].sort_values(
+                        'prioridad'
+                    ).style.format({
+                        'cantidad_disponible': '{:,.0f}',
+                        'cantidad_sugerida': '{:,.0f}',
+                        'precio_compra': '${:,.2f}',
+                        'costo_estimado': '${:,.2f}'
+                    }),
+                    use_container_width=True
+                )
+    else:
+        # Mostrar tabla del proveedor seleccionado
+        st.markdown(f"#### 📋 Detalle de Pedido: {proveedor_seleccionado}")
+        st.dataframe(
+            df_filtrado[['nombre', 'familia', 'prioridad', 'cantidad_disponible', 
+                        'venta_diaria', 'cantidad_sugerida', 'precio_compra', 'costo_estimado']].sort_values(
+                'prioridad'
+            ).style.format({
+                'cantidad_disponible': '{:,.0f}',
+                'venta_diaria': '{:,.1f}/día',
+                'cantidad_sugerida': '{:,.0f}',
+                'precio_compra': '${:,.2f}',
+                'costo_estimado': '${:,.2f}'
+            }),
+            use_container_width=True
+        )
+
+
+def render_purchase_order_generator(df_sugerencias: pd.DataFrame):
+    """Genera órdenes de compra descargables."""
+    if df_sugerencias.empty:
+        return
+    
+    st.subheader("📝 Generar Órdenes de Compra")
+    
+    # Filtrar productos con proveedor
+    df_con_proveedor = df_sugerencias[df_sugerencias['proveedor'].notna()].copy()
+    
+    if df_con_proveedor.empty:
+        st.warning("No hay productos con proveedor asignado.")
+        return
+    
+    # Opciones de filtro
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        proveedor_orden = st.selectbox(
+            "Proveedor para la orden",
+            options=['Seleccionar...'] + sorted(df_con_proveedor['proveedor'].unique().tolist()),
+            key="proveedor_orden"
+        )
+    
+    with col2:
+        prioridad_minima = st.selectbox(
+            "Prioridad mínima",
+            options=['Todas', '🔴 Urgente', '🟠 Alta', '🟡 Media'],
+            key="prioridad_orden"
+        )
+    
+    if proveedor_orden == 'Seleccionar...':
+        st.info("👆 Selecciona un proveedor para generar la orden de compra.")
+        return
+    
+    # Filtrar por proveedor y prioridad
+    df_orden = df_con_proveedor[df_con_proveedor['proveedor'] == proveedor_orden].copy()
+    
+    if prioridad_minima != 'Todas':
+        prioridades_incluir = {
+            '🔴 Urgente': ['🔴 Urgente'],
+            '🟠 Alta': ['🔴 Urgente', '🟠 Alta'],
+            '🟡 Media': ['🔴 Urgente', '🟠 Alta', '🟡 Media']
+        }
+        df_orden = df_orden[df_orden['prioridad'].isin(prioridades_incluir[prioridad_minima])]
+    
+    if df_orden.empty:
+        st.warning("No hay productos que cumplan los criterios seleccionados.")
+        return
+    
+    # Mostrar resumen de la orden
+    st.markdown("---")
+    st.markdown(f"### 📋 Orden de Compra - {proveedor_orden}")
+    st.markdown(f"**Fecha:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("📦 Total Productos", f"{len(df_orden)}")
+    with col2:
+        st.metric("🔢 Total Unidades", f"{df_orden['cantidad_sugerida'].sum():,.0f}")
+    with col3:
+        st.metric("💰 Costo Total", f"${df_orden['costo_estimado'].sum():,.2f}")
+    
+    # Tabla de la orden
+    orden_display = df_orden[['nombre', 'familia', 'cantidad_sugerida', 'precio_compra', 'costo_estimado']].copy()
+    orden_display.columns = ['Producto', 'Familia', 'Cantidad', 'Precio Unit.', 'Subtotal']
+    
+    st.dataframe(
+        orden_display.style.format({
+            'Cantidad': '{:,.0f}',
+            'Precio Unit.': '${:,.2f}',
+            'Subtotal': '${:,.2f}'
+        }),
+        use_container_width=True
+    )
+    
+    # Agregar fila de total
+    st.markdown(f"**TOTAL: ${df_orden['costo_estimado'].sum():,.2f}**")
+    
+    # Botones de descarga
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # CSV
+        csv_orden = orden_display.to_csv(index=False)
+        st.download_button(
+            label="📥 Descargar CSV",
+            data=csv_orden,
+            file_name=f"orden_compra_{proveedor_orden.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    
+    with col2:
+        # Excel con formato
+        try:
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Hoja de orden
+                orden_display.to_excel(writer, index=False, sheet_name='Orden de Compra')
+                
+                # Hoja de resumen
+                resumen = pd.DataFrame({
+                    'Campo': ['Proveedor', 'Fecha', 'Total Productos', 'Total Unidades', 'Costo Total'],
+                    'Valor': [
+                        proveedor_orden,
+                        datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        len(df_orden),
+                        f"{df_orden['cantidad_sugerida'].sum():,.0f}",
+                        f"${df_orden['costo_estimado'].sum():,.2f}"
+                    ]
+                })
+                resumen.to_excel(writer, index=False, sheet_name='Resumen')
+            
+            excel_data = output.getvalue()
+            st.download_button(
+                label="📊 Descargar Excel",
+                data=excel_data,
+                file_name=f"orden_compra_{proveedor_orden.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        except ImportError:
+            st.warning("openpyxl no instalado para exportar Excel")
+
+
+def render_purchase_suggestions(df: pd.DataFrame):
+    """Renderiza el módulo completo de sugerencias de compras."""
+    if df.empty:
+        st.warning("No hay datos de ventas para generar sugerencias.")
+        return
+    
+    st.header("🛒 Sugerencias de Compras a Proveedores")
+    
+    st.markdown("""
+    Este módulo analiza las ventas de los últimos 30 días y el inventario actual
+    para sugerir qué productos comprar y en qué cantidades, agrupados por proveedor.
+    
+    **Criterios de prioridad:**
+    - 🔴 **Urgente**: Stock para ≤3 días
+    - 🟠 **Alta**: Stock para ≤7 días  
+    - 🟡 **Media**: Stock para ≤15 días
+    - 🟢 **Baja**: Stock suficiente
+    """)
+    
+    # Cargar datos de inventario
+    df_inventario = load_inventory_data()
+    
+    # Calcular sugerencias
+    df_sugerencias = calculate_reorder_suggestions(df, df_inventario)
+    
+    if df_sugerencias.empty:
+        st.success("✅ ¡Excelente! No hay productos que necesiten reposición urgente.")
+        return
+    
+    # Métricas generales
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "📦 Productos a Pedir",
+            f"{len(df_sugerencias)}"
+        )
+    
+    with col2:
+        st.metric(
+            "🔢 Total Unidades",
+            f"{df_sugerencias['cantidad_sugerida'].sum():,.0f}"
+        )
+    
+    with col3:
+        st.metric(
+            "💰 Inversión Estimada",
+            f"${df_sugerencias['costo_estimado'].sum():,.2f}"
+        )
+    
+    with col4:
+        proveedores_unicos = df_sugerencias['proveedor'].dropna().nunique()
+        st.metric(
+            "🏭 Proveedores",
+            f"{proveedores_unicos}"
+        )
+    
+    st.markdown("---")
+    
+    # Sub-tabs para las diferentes vistas
+    subtab1, subtab2, subtab3 = st.tabs([
+        "🚨 Alertas de Stock",
+        "🏭 Por Proveedor",
+        "📝 Generar Orden"
+    ])
+    
+    with subtab1:
+        render_low_stock_alerts(df_sugerencias)
+    
+    with subtab2:
+        render_purchase_by_provider(df_sugerencias)
+    
+    with subtab3:
+        render_purchase_order_generator(df_sugerencias)
+
+
+# =============================================================================
 # Main App
 # =============================================================================
 
@@ -1230,12 +1669,13 @@ def main():
     render_alerts(df_filtered)
     
     # Tabs para organizar contenido
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Dashboard", 
         "💵 Márgenes",
         "🔮 Predicciones",
         "📈 Análisis ABC",
         "👤 Vendedores",
+        "🛒 Compras",
         "📋 Datos",
         "📈 Gráficos"
     ])
@@ -1257,13 +1697,16 @@ def main():
         render_seller_ranking(df_filtered)
     
     with tab6:
+        render_purchase_suggestions(df_filtered)
+    
+    with tab7:
         render_data_table(df_filtered)
         st.markdown("---")
         render_export(df_filtered)
     
-    with tab7:
+    with tab8:
         st.header("📈 Análisis Visual Completo")
-        render_charts(df_filtered, key_prefix="tab7_")
+        render_charts(df_filtered, key_prefix="tab8_")
 
 
 if __name__ == "__main__":
